@@ -21,7 +21,7 @@ original_model = models.vgg19(pretrained=True)
 norm_values = ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
 styleTensorNames = ['conv1_1', 'conv2_1', 'conv3_1', 'conv4_1', 'conv5_1']
-contentTensorName = 'conv4_1'
+contentTensorName = 'conv3_1'
 
 style_image_path = os.path.join(os.path.dirname(__file__), 'data/style_van_gogh.jpg')
 content_image_path = os.path.join(os.path.dirname(__file__), 'data/content_bridge.jpg')
@@ -38,23 +38,32 @@ args = parser.parse_args()
 # Transforms
 transform_image = transforms.Compose([
     transforms.Resize(imsize),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=norm_values[0], std=norm_values[1])
+    transforms.ToTensor()
 ])
 
 detransform_tensor = transforms.Compose([
-    UnNormalize(norm_values[0], norm_values[1]),
     transforms.ToPILImage()
 ])
+
+class Normalization(nn.Module):
+    def __init__(self, mean, std):
+        super(Normalization, self).__init__()
+        self.mean = Variable(torch.FloatTensor(mean).view(-1, 1, 1))
+        self.std = Variable(torch.FloatTensor(std).view(-1, 1, 1))
+
+    def forward(self, img):
+        return (img - self.mean) / self.std
 
 class Model(nn.Module):
     def __init__(self, original_model):
         super(Model, self).__init__()
 
+        self.norm = Normalization(norm_values[0], norm_values[1])
         self.features = nn.Sequential(*list(original_model.features.children())[:-2])
 
     def forward(self, x):
-        return self.features(x)
+        norm = self.norm(x)
+        return self.features(norm)
 
 model = Model(original_model)
 
@@ -69,7 +78,7 @@ def image_loader(img_path):
 
 def image_reconstruct(tensor):
     newT = tensor.data.clone()
-    newT = tensor.squeeze(0)
+    newT = newT.squeeze(0)
     return detransform_tensor(newT)
 
 def generate_noise_image(content_image, noise_strength = noise_strength):
@@ -192,32 +201,45 @@ input_image = Variable(torch.FloatTensor(generate_noise_image(content_image)), r
 if torch.cuda.is_available():
     input_image = input_image.cuda()
 
-optimizer = optim.SGD([input_image], lr=args.lr, momentum=0.9, weight_decay=5e-4)
+# optimizer = optim.SGD([input_image], lr=args.lr, momentum=0.9, weight_decay=5e-4)
 #optimizer = optim.Adam([input_image], lr = args.lr)
+# def train(epoch):
+#     model.train()
+#     optimizer.zero_grad()
 
+#     model(input_image)
+
+#     #Start with content only
+#     loss = criterion(contentTensorTrain, contentTensor)
+#     loss.backward()
+#     optimizer.step()
+#     print('Loss: {}'.format(loss.data[0]))
+#     input_image.data.clamp_(-2.5, 2.5)
+
+#for LBFGS optim
+optimizer = optim.LBFGS([input_image])
 def train(epoch):
     model.train()
-    optimizer.zero_grad()
-
-    model(input_image)
-
-    #Start with content only
-    loss = criterion(contentTensorTrain, contentTensor)
-    loss.backward()
-    optimizer.step()
-
-    print('Loss: {}'.format(loss.data[0]))
-
+    def closure():
+        input_image.data.clamp_(0, 1)
+        optimizer.zero_grad()
+        model(input_image)
+        loss = criterion(contentTensorTrain, contentTensor)
+        loss.backward()
+        print('Loss: {}'.format(loss.data[0]))
+        return loss
+    optimizer.step(closure)
+    input_image.data.clamp_(0, 1)
 
 import matplotlib.pyplot as plt
-def show_output_img():
+def show():
     output_image = image_reconstruct(input_image)
     plt.imshow(output_image)
     plt.show()
 
 def start(startEpoch = 0):
     for epoch in range(startEpoch, startEpoch + 1000):
-#        adjust_learning_rate(optimizer, epoch, args.lr, 0.8, 150, 0.2)
+        # adjust_learning_rate(optimizer, epoch, args.lr, 0.8, 150, 0.2)
         print('epoch {}'.format(epoch))
         train(epoch)
 
