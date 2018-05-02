@@ -20,8 +20,12 @@ import numpy as np
 original_model = models.vgg19(pretrained=True)
 norm_values = ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
-styleTensorNames = ['conv1_1', 'conv2_1', 'conv3_1', 'conv4_1', 'conv5_1']
-contentTensorName = 'conv3_1'
+styleTensorNames = ['conv_1', 'conv_2', 'conv_3', 'conv_4', 'conv_5']
+contentTensorNames = ['conv_3']
+
+styleRelativeWeights = [0.2, 0.2, 0.5, 0.5, 0.8]
+styleWeight = 100000
+contentWeight = 1
 
 style_image_path = os.path.join(os.path.dirname(__file__), 'data/style_van_gogh.jpg')
 content_image_path = os.path.join(os.path.dirname(__file__), 'data/content_bridge.jpg')
@@ -54,18 +58,97 @@ class Normalization(nn.Module):
     def forward(self, img):
         return (img - self.mean) / self.std
 
+class ContentLoss(nn.Module):
+
+    def __init__(self, target,):
+        super(ContentLoss, self).__init__()
+        # we 'detach' the target content from the tree used
+        # to dynamically compute the gradient: this is a stated value,
+        # not a variable. Otherwise the forward method of the criterion
+        # will throw an error.
+        self.target = target.detach()
+
+    def forward(self, input):
+        self.loss = F.mse_loss(input, self.target)
+        return input
+
+def gram_matrix(input):
+    a, b, c, d = input.size()  # a=batch size(=1)
+    # b=number of feature maps
+    # (c,d)=dimensions of a f. map (N=c*d)
+
+    features = input.view(a * b, c * d)  # resise F_XL into \hat F_XL
+
+    G = torch.mm(features, features.t())  # compute the gram product
+
+    # we 'normalize' the values of the gram matrix
+    # by dividing by the number of element in each feature maps.
+    return G.div(a * b * c * d)
+
+class StyleLoss(nn.Module):
+
+    def __init__(self, target_feature):
+        super(StyleLoss, self).__init__()
+        self.target = gram_matrix(target_feature).detach()
+
+    def forward(self, input):
+        G = gram_matrix(input)
+        self.loss = F.mse_loss(G, self.target)
+        return input
+
 class Model(nn.Module):
-    def __init__(self, original_model):
+    def __init__(self, original_model, content_image, style_image):
         super(Model, self).__init__()
 
-        self.norm = Normalization(norm_values[0], norm_values[1])
-        self.features = nn.Sequential(*list(original_model.features.children())[:-2])
+        self.features = nn.Sequential(Normalization(norm_values[0], norm_values[1]))
+
+        self.content_losses = []
+        self.style_losses = []
+
+        i = 0  # increment every time we see a conv
+        for layer in original_model.features.eval().children():
+            if isinstance(layer, nn.Conv2d):
+                i += 1
+                name = 'conv_{}'.format(i)
+            elif isinstance(layer, nn.ReLU):
+                name = 'relu_{}'.format(i)
+                # The in-place version doesn't play very nicely with the ContentLoss
+                # and StyleLoss we insert below. So we replace with out-of-place
+                # ones here.
+                layer = nn.ReLU(inplace=False)
+            elif isinstance(layer, nn.MaxPool2d):
+                name = 'pool_{}'.format(i)
+            elif isinstance(layer, nn.BatchNorm2d):
+                name = 'bn_{}'.format(i)
+            else:
+                raise RuntimeError('Unrecognized layer: {}'.format(layer.__class__.__name__))
+
+            self.features.add_module(name, layer)
+
+            if name in contentTensorNames:
+                # add content loss:
+                target = self.features(content_image).detach()
+                content_loss = ContentLoss(target)
+                self.features.add_module("content_loss_{}".format(i), content_loss)
+                self.content_losses.append(content_loss)
+
+            if name in styleTensorNames:
+                # add style loss:
+                target_feature = self.features(style_image).detach()
+                style_loss = StyleLoss(target_feature)
+                self.features.add_module("style_loss_{}".format(i), style_loss)
+                self.style_losses.append(style_loss)
+
+        # now we trim off the layers after the last content and style losses
+        for i in range(len(self.features) - 1, -1, -1):
+            if isinstance(self.features[i], ContentLoss) or isinstance(self.features[i], StyleLoss):
+                break
+
+        self.features = self.features[:(i + 1)]
 
     def forward(self, x):
-        norm = self.norm(x)
-        return self.features(norm)
+        return self.features(x)
 
-model = Model(original_model)
 
 def image_loader(img_path):
     image = Image.open(img_path)
@@ -89,147 +172,58 @@ def generate_noise_image(content_image, noise_strength = noise_strength):
 style_image = image_loader(style_image_path)
 content_image = image_loader(content_image_path)
 
-contentTensor = None
-contentTensorTrain = None
-styleTensors = [None, None, None, None, None]
-styleTensorsTrain = [None, None, None, None, None]
-currentRun = None
-def feature_capture_hook(module, input, output):
-    global contentTensor
-    global styleTensors
-    global contentTensorTrain
-    global styleTensorsTrain
-
-    if currentRun == 'style':
-        if module._name == styleTensorNames[0]:
-            styleTensors[0] = output.clone()
-            styleTensors[0] = styleTensors[0].detach()
-            styleTensors[0].requires_grad = False
-
-        elif module._name == styleTensorNames[1]:
-            styleTensors[1] = output.clone()
-            styleTensors[1] = styleTensors[0].detach()
-            styleTensors[1].requires_grad = False
-
-        elif module._name == styleTensorNames[2]:
-            styleTensors[2] = output.clone()
-            styleTensors[2] = styleTensors[0].detach()
-            styleTensors[2].requires_grad = False
-            
-        elif module._name == styleTensorNames[3]:
-            styleTensors[3] = output.clone()
-            styleTensors[3] = styleTensors[0].detach()
-            styleTensors[3].requires_grad = False
-            
-        elif module._name == styleTensorNames[4]:
-            styleTensors[4] = output.clone()
-            styleTensors[4] = styleTensors[0].detach()
-            styleTensors[4].requires_grad = False
-            
-
-    elif currentRun == 'content':
-        if module._name == contentTensorName:
-            contentTensor = output.clone()
-            contentTensor = contentTensor.detach()
-            contentTensor.requires_grad = False
-
-    elif currentRun == 'train':
-        if module._name == styleTensorNames[0]:
-            styleTensorsTrain[0] = output
-
-        elif module._name == styleTensorNames[1]:
-            styleTensorsTrain[1] = output
-
-        elif module._name == styleTensorNames[2]:
-            styleTensorsTrain[2] = output
-            
-        elif module._name == styleTensorNames[3]:
-            styleTensorsTrain[3] = output
-            
-        elif module._name == styleTensorNames[4]:
-            styleTensorsTrain[4] = output
-        
-
-        if module._name == contentTensorName:
-            contentTensorTrain = output
-
-model.features[0]._name = 'conv1_1'
-model.features[2]._name = 'conv1_2'
-model.features[5]._name = 'conv2_1'
-model.features[7]._name = 'conv2_2'
-model.features[10]._name = 'conv3_1'
-model.features[12]._name = 'conv3_2'
-model.features[14]._name = 'conv3_3'
-model.features[16]._name = 'conv3_4'
-model.features[19]._name = 'conv4_1'
-model.features[21]._name = 'conv4_2'
-model.features[23]._name = 'conv4_3'
-model.features[25]._name = 'conv4_4'
-model.features[28]._name = 'conv5_1'
-model.features[30]._name = 'conv5_2'
-model.features[32]._name = 'conv5_3'
-model.features[34]._name = 'conv5_4'
-
-model.features[0].register_forward_hook(feature_capture_hook)
-model.features[2].register_forward_hook(feature_capture_hook)
-model.features[5].register_forward_hook(feature_capture_hook)
-model.features[7].register_forward_hook(feature_capture_hook)
-model.features[10].register_forward_hook(feature_capture_hook)
-model.features[12].register_forward_hook(feature_capture_hook)
-model.features[14].register_forward_hook(feature_capture_hook)
-model.features[16].register_forward_hook(feature_capture_hook)
-model.features[19].register_forward_hook(feature_capture_hook)
-model.features[21].register_forward_hook(feature_capture_hook)
-model.features[23].register_forward_hook(feature_capture_hook)
-model.features[25].register_forward_hook(feature_capture_hook)
-model.features[28].register_forward_hook(feature_capture_hook)
-model.features[30].register_forward_hook(feature_capture_hook)
-model.features[32].register_forward_hook(feature_capture_hook)
-model.features[34].register_forward_hook(feature_capture_hook)
-
-currentRun = 'style'
-model(style_image)
-
-currentRun = 'content'
-model(content_image)
-
-currentRun = 'train'
-
-criterion = nn.MSELoss()
+model = Model(original_model, content_image, style_image)
 
 input_image = Variable(torch.FloatTensor(generate_noise_image(content_image)), requires_grad=True)
 if torch.cuda.is_available():
     input_image = input_image.cuda()
 
-# optimizer = optim.SGD([input_image], lr=args.lr, momentum=0.9, weight_decay=5e-4)
-#optimizer = optim.Adam([input_image], lr = args.lr)
-# def train(epoch):
-#     model.train()
-#     optimizer.zero_grad()
-
-#     model(input_image)
-
-#     #Start with content only
-#     loss = criterion(contentTensorTrain, contentTensor)
-#     loss.backward()
-#     optimizer.step()
-#     print('Loss: {}'.format(loss.data[0]))
-#     input_image.data.clamp_(-2.5, 2.5)
-
-#for LBFGS optim
-optimizer = optim.LBFGS([input_image])
+#optimizer = optim.SGD([input_image], lr=args.lr, momentum=0.9, weight_decay=5e-4)
+optimizer = optim.Adam([input_image], lr = args.lr)
 def train(epoch):
     model.train()
-    def closure():
-        input_image.data.clamp_(0, 1)
-        optimizer.zero_grad()
-        model(input_image)
-        loss = criterion(contentTensorTrain, contentTensor)
-        loss.backward()
-        print('Loss: {}'.format(loss.data[0]))
-        return loss
-    optimizer.step(closure)
+    optimizer.zero_grad()
+
+    model(input_image)
+
+    content_loss = 0
+    for ct_loss in model.content_losses:
+        content_loss += ct_loss.loss
+
+    style_loss = 0
+    i = 0
+    for st_loss in model.style_losses:
+        style_loss += (st_loss.loss * styleRelativeWeights[i])
+        i += 1
+
+    content_loss = content_loss * contentWeight
+    style_loss = style_loss * styleWeight
+
+    loss = content_loss + style_loss
+
+    loss.backward()
+    optimizer.step()
+    print('Content Loss: {}, Style Loss: {}, Total: {}'.format(content_loss, style_loss, loss))
     input_image.data.clamp_(0, 1)
+
+# #for LBFGS optim
+# optimizer = optim.LBFGS([input_image])
+# def train(epoch):
+#     model.train()
+#     def closure():
+#         input_image.data.clamp_(0, 1)
+#         optimizer.zero_grad()
+#         model(input_image)
+
+#         content_loss = 0
+#         for ct_loss in model.content_losses:
+#             content_loss += ct_loss.loss
+#         loss = content_loss
+#         loss.backward()
+#         print('Loss: {}'.format(loss.data[0]))
+#         return loss
+#     optimizer.step(closure)
+#     input_image.data.clamp_(0, 1)
 
 import matplotlib.pyplot as plt
 def show():
@@ -237,11 +231,14 @@ def show():
     plt.imshow(output_image)
     plt.show()
 
-def start(startEpoch = 0):
-    for epoch in range(startEpoch, startEpoch + 1000):
+epoch = 0
+def go():
+    global epoch
+    while True:
         # adjust_learning_rate(optimizer, epoch, args.lr, 0.8, 150, 0.2)
         print('epoch {}'.format(epoch))
         train(epoch)
+        epoch += 1
 
 if __name__ == '__main__':
-    start(0)
+    go()
