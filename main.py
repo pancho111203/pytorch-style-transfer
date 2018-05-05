@@ -7,35 +7,85 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.backends.cudnn as cudnn
 import torchvision.models as models
 import torch.optim as optim
 from torch.autograd import Variable
 from torchvision import transforms
 from PIL import Image
 from utils.transforms import UnNormalize
-from utils.utils import adjust_learning_rate
+from utils.utils import adjust_learning_rate, set_learning_rate, get_learning_rate, LearningRateAdapter
 import numpy as np
 
 # Inputs
 original_model = models.vgg19(pretrained=True)
 norm_values = ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
-styleTensorNames = ['conv_1', 'conv_2', 'conv_3', 'conv_4', 'conv_5']
-contentTensorNames = ['conv_3']
+styleTensorNames = ['conv_1', 'conv_3', 'conv_5', 'conv_9', 'conv_13']
+contentTensorNames = ['conv_10']
 
-styleRelativeWeights = [0.2, 0.2, 0.5, 0.5, 0.8]
-styleWeight = 100000
+styleRelativeWeights = [1, 1, 1, 1, 1]
+styleWeight = 500.0
 contentWeight = 1
 
-style_image_path = os.path.join(os.path.dirname(__file__), 'data/style_van_gogh.jpg')
-content_image_path = os.path.join(os.path.dirname(__file__), 'data/content_bridge.jpg')
+"""
+    0 is conv1 (3, 3, 3, 64)
+    1 is relu
+    2 is conv2 (3, 3, 64, 64)
+    3 is relu    
+    4 is maxpool
+    5 is conv3 (3, 3, 64, 128)
+    6 is relu
+    7 is conv4 (3, 3, 128, 128)
+    8 is relu
+    9 is maxpool
+    10 is conv5 (3, 3, 128, 256)
+    11 is relu
+    12 is conv6 (3, 3, 256, 256)
+    13 is relu
+    14 is conv7 (3, 3, 256, 256)
+    15 is relu
+    16 is conv8 (3, 3, 256, 256)
+    17 is relu
+    18 is maxpool
+    19 is conv9 (3, 3, 256, 512)
+    20 is relu
+    21 is conv10 (3, 3, 512, 512)
+    22 is relu
+    23 is conv11 (3, 3, 512, 512)
+    24 is relu
+    25 is conv12 (3, 3, 512, 512)
+    26 is relu
+    27 is maxpool
+    28 is conv13 (3, 3, 512, 512)
+    29 is relu
+    30 is conv14 (3, 3, 512, 512)
+    31 is relu
+    32 is conv15 (3, 3, 512, 512)
+    33 is relu
+    34 is conv16 (3, 3, 512, 512)
+    35 is relu
+    36 is maxpool
+    37 is fullyconnected (7, 7, 512, 4096)
+    38 is relu
+    39 is fullyconnected (1, 1, 4096, 4096)
+    40 is relu
+    41 is fullyconnected (1, 1, 4096, 1000)
+    42 is softmax
+"""
+
+
+style_image_name = 'data/style_vangogh.jpg'
+content_image_name = 'data/content_bridge.jpg'
+style_image_path = os.path.join(os.path.dirname(__file__), style_image_name)
+content_image_path = os.path.join(os.path.dirname(__file__), content_image_name)
 
 imsize = (224, 224)
 
 noise_strength = 0.6
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
-parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
+parser.add_argument('--lr', default=100, type=float, help='learning rate')
 parser.add_argument('--resume', '-r', action='store_true', help='resume from checkpoint')
 args = parser.parse_args()
 
@@ -172,15 +222,26 @@ def generate_noise_image(content_image, noise_strength = noise_strength):
 style_image = image_loader(style_image_path)
 content_image = image_loader(content_image_path)
 
+if torch.cuda.is_available():
+    style_image = style_image.cuda()
+    content_image = content_image.cuda()
+
 model = Model(original_model, content_image, style_image)
 
 input_image = Variable(torch.FloatTensor(generate_noise_image(content_image)), requires_grad=True)
 if torch.cuda.is_available():
+    model.cuda()
+    model = torch.nn.DataParallel(model, device_ids=range(torch.cuda.device_count()))
+    cudnn.benchmark = True
     input_image = input_image.cuda()
 
-#optimizer = optim.SGD([input_image], lr=args.lr, momentum=0.9, weight_decay=5e-4)
+temp_checkpoint_path = os.path.join(os.path.dirname(__file__), 'temp_checkpoint.ckpt')
+prev_loss = None
 optimizer = optim.Adam([input_image], lr = args.lr)
+lr_adapter = LearningRateAdapter(optimizer, args.lr, min_lr=0.01)
 def train(epoch):
+    global input_image
+    global prev_loss
     model.train()
     optimizer.zero_grad()
 
@@ -206,7 +267,28 @@ def train(epoch):
     print('Content Loss: {}, Style Loss: {}, Total: {}'.format(content_loss, style_loss, loss))
     input_image.data.clamp_(0, 1)
 
+    if prev_loss is None:
+        prev_loss = loss
+        state = {
+            'input_image': input_image,
+            'loss': loss
+        }
+        torch.save(state, temp_checkpoint_path)
+    elif loss < prev_loss:
+        state = {
+            'input_image': input_image,
+            'loss': loss
+        }
+        torch.save(state, temp_checkpoint_path)
+
+    lr_changed = lr_adapter.update_loss(loss)
+    if lr_changed and os.path.isfile(temp_checkpoint_path):
+        checkpoint = torch.load(temp_checkpoint_path)
+        print('reverting to previous best: {}'.format(checkpoint['loss']))
+        input_image = checkpoint['input_image']
+
 # #for LBFGS optim
+# # Currently not working, learning rate fluctuates a lot and never decreases consistently
 # optimizer = optim.LBFGS([input_image])
 # def train(epoch):
 #     model.train()
@@ -218,17 +300,34 @@ def train(epoch):
 #         content_loss = 0
 #         for ct_loss in model.content_losses:
 #             content_loss += ct_loss.loss
-#         loss = content_loss
+        
+#         style_loss = 0
+#         i = 0
+#         for st_loss in model.style_losses:
+#             style_loss += (st_loss.loss * styleRelativeWeights[i])
+#             i += 1
+
+#         content_loss = content_loss * contentWeight
+#         style_loss = style_loss * styleWeight
+
+#         loss = content_loss + style_loss
+    
 #         loss.backward()
-#         print('Loss: {}'.format(loss.data[0]))
-#         return loss
+#         print('Content Loss: {}, Style Loss: {}, Total: {}'.format(content_loss, style_loss, loss))
+#         return content_loss + style_loss
 #     optimizer.step(closure)
 #     input_image.data.clamp_(0, 1)
 
 import matplotlib.pyplot as plt
 def show():
-    output_image = image_reconstruct(input_image)
-    plt.imshow(output_image)
+    f, axarray = plt.subplots(1, 3)
+    axarray[0].imshow(image_reconstruct(content_image.detach()))
+    axarray[0].axis('off')
+    axarray[1].imshow(image_reconstruct(style_image.detach()))
+    axarray[1].axis('off')
+    axarray[2].imshow(image_reconstruct(input_image.detach()))  
+    axarray[2].axis('off')
+
     plt.show()
 
 epoch = 0
@@ -239,6 +338,33 @@ def go():
         print('epoch {}'.format(epoch))
         train(epoch)
         epoch += 1
+
+def save(info=None):
+    t_info = '' if info is None else '_{}'.format(info)
+    style_img_sn = style_image_name.split('_')[1].split('.')[0]
+    content_img_sn = content_image_name.split('_')[1].split('.')[0]
+    style_config_str = ''
+    for i in range(0, len(styleTensorNames)):
+        tensorName = styleTensorNames[i]
+        relativeWeigth = styleRelativeWeights[i]
+        tensorIndex = tensorName.split('_')[1]
+
+        tensor_config_str = tensorIndex + ':' + str(relativeWeigth)
+        style_config_str += tensor_config_str
+        if i < len(styleTensorNames) - 1:
+            style_config_str += ','
+
+    content_config_str = ''
+    for i in range(0, len(contentTensorNames)):
+        content_config_str += contentTensorNames[i].split('_')[1]
+        if i < len(contentTensorNames) - 1:
+            content_config_str += ','
+
+    filename = style_img_sn + 'x' + str(styleWeight) + '@' + style_config_str + '_' + content_img_sn + 'x' + str(contentWeight) + '@' + content_config_str + '_' + str(epoch) + t_info
+    path = os.path.join(os.path.dirname(__file__), 'outputs/{}.jpg'.format(filename))
+
+    output_img = image_reconstruct(input_image.detach())
+    output_img.save(path)
 
 if __name__ == '__main__':
     go()
