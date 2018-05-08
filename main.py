@@ -10,23 +10,30 @@ import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import torchvision.models as models
 import torch.optim as optim
-from torch.autograd import Variable
 from torchvision import transforms
 from PIL import Image
 from utils.transforms import UnNormalize
 from utils.utils import adjust_learning_rate, set_learning_rate, get_learning_rate, LearningRateAdapter
 import numpy as np
+import matplotlib.pyplot as plt
 
 # Inputs
 original_model = models.vgg19(pretrained=True)
 norm_values = ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
-styleTensorNames = ['conv_1', 'conv_3', 'conv_5', 'conv_9', 'conv_13']
-contentTensorNames = ['conv_10']
+styleTensorNames = ['conv_2', 'conv_4', 'conv_8', 'conv_12', 'conv_16']
+contentTensorNames = ['conv_9']
 
-styleRelativeWeights = [1, 1, 1, 1, 1]
-styleWeight = 500.0
+styleRelativeWeights = [0.5, 0.5, 1.5, 3.0, 4.0]
+styleWeight = 100000.0
 contentWeight = 1
+
+info = 'avgpool_onlynoise'
+
+imsize = (224, 224)
+
+use_only_noise = True
+noise_strength = 0.6
 
 """
     0 is conv1 (3, 3, 3, 64)
@@ -74,15 +81,17 @@ contentWeight = 1
     42 is softmax
 """
 
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+original_model = original_model.to(device)
+
 
 style_image_name = 'data/style_vangogh.jpg'
 content_image_name = 'data/content_bridge.jpg'
 style_image_path = os.path.join(os.path.dirname(__file__), style_image_name)
 content_image_path = os.path.join(os.path.dirname(__file__), content_image_name)
 
-imsize = (224, 224)
-
-noise_strength = 0.6
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
 parser.add_argument('--lr', default=100, type=float, help='learning rate')
@@ -102,8 +111,11 @@ detransform_tensor = transforms.Compose([
 class Normalization(nn.Module):
     def __init__(self, mean, std):
         super(Normalization, self).__init__()
-        self.mean = Variable(torch.FloatTensor(mean).view(-1, 1, 1))
-        self.std = Variable(torch.FloatTensor(std).view(-1, 1, 1))
+        self.mean = torch.FloatTensor(mean).view(-1, 1, 1)
+        self.std = torch.FloatTensor(std).view(-1, 1, 1)
+        
+        self.mean = self.mean.to(device)
+        self.std = self.std.to(device)
 
     def forward(self, img):
         return (img - self.mean) / self.std
@@ -168,6 +180,8 @@ class Model(nn.Module):
                 layer = nn.ReLU(inplace=False)
             elif isinstance(layer, nn.MaxPool2d):
                 name = 'pool_{}'.format(i)
+
+                layer = nn.AvgPool2d(2)
             elif isinstance(layer, nn.BatchNorm2d):
                 name = 'bn_{}'.format(i)
             else:
@@ -203,57 +217,61 @@ class Model(nn.Module):
 def image_loader(img_path):
     image = Image.open(img_path)
     image = transform_image(image).float()
-    image = Variable(image, requires_grad=True)
+    image.requires_grad_()
     image = image.unsqueeze(0)
-    if torch.cuda.is_available():
-        image = image.cuda()
+    image = image.to(device)
     return image
 
 def image_reconstruct(tensor):
-    newT = tensor.data.clone()
+    newT = tensor.to(torch.device('cpu')).clone()
     newT = newT.squeeze(0)
     return detransform_tensor(newT)
 
 def generate_noise_image(content_image, noise_strength = noise_strength):
-    noise_image = np.random.uniform(-20, 20, (1, 3 ,imsize[0], imsize[1])).astype('float32')
-    input_image = noise_image * noise_strength + content_image.data.numpy() * (1 - noise_strength)
-    return input_image
+    noise_image = torch.tensor(np.random.uniform(-20, 20, (1, 3 ,imsize[0], imsize[1])).astype('float32'))
+    noise_image = noise_image.to(device)
+    if use_only_noise:
+        input_image = noise_image
+    else:
+        input_image = noise_image * noise_strength + content_image * (1 - noise_strength)
+    return input_image.detach()
 
 style_image = image_loader(style_image_path)
 content_image = image_loader(content_image_path)
 
-if torch.cuda.is_available():
-    style_image = style_image.cuda()
-    content_image = content_image.cuda()
+style_image = style_image.to(device)
+content_image = content_image.to(device)
 
 model = Model(original_model, content_image, style_image)
 
-input_image = Variable(torch.FloatTensor(generate_noise_image(content_image)), requires_grad=True)
+input_image = generate_noise_image(content_image)
 if torch.cuda.is_available():
     model.cuda()
     model = torch.nn.DataParallel(model, device_ids=range(torch.cuda.device_count()))
     cudnn.benchmark = True
     input_image = input_image.cuda()
+    module = model.module
+else:
+    module = model
 
-temp_checkpoint_path = os.path.join(os.path.dirname(__file__), 'temp_checkpoint.ckpt')
-prev_loss = None
+input_image.requires_grad_()
+
 optimizer = optim.Adam([input_image], lr = args.lr)
-lr_adapter = LearningRateAdapter(optimizer, args.lr, min_lr=0.01)
+lr_adapter = LearningRateAdapter(optimizer, args.lr, min_lr=0.01, lr_reduction_percentage=0.7, loss_worsening_count_limit=8)
 def train(epoch):
     global input_image
-    global prev_loss
     model.train()
     optimizer.zero_grad()
 
     model(input_image)
 
     content_loss = 0
-    for ct_loss in model.content_losses:
+    for ct_loss in module.content_losses:
         content_loss += ct_loss.loss
 
     style_loss = 0
     i = 0
-    for st_loss in model.style_losses:
+    for st_loss in module.style_losses:
         style_loss += (st_loss.loss * styleRelativeWeights[i])
         i += 1
 
@@ -267,25 +285,7 @@ def train(epoch):
     print('Content Loss: {}, Style Loss: {}, Total: {}'.format(content_loss, style_loss, loss))
     input_image.data.clamp_(0, 1)
 
-    if prev_loss is None:
-        prev_loss = loss
-        state = {
-            'input_image': input_image,
-            'loss': loss
-        }
-        torch.save(state, temp_checkpoint_path)
-    elif loss < prev_loss:
-        state = {
-            'input_image': input_image,
-            'loss': loss
-        }
-        torch.save(state, temp_checkpoint_path)
-
     lr_changed = lr_adapter.update_loss(loss)
-    if lr_changed and os.path.isfile(temp_checkpoint_path):
-        checkpoint = torch.load(temp_checkpoint_path)
-        print('reverting to previous best: {}'.format(checkpoint['loss']))
-        input_image = checkpoint['input_image']
 
 # #for LBFGS optim
 # # Currently not working, learning rate fluctuates a lot and never decreases consistently
@@ -298,12 +298,12 @@ def train(epoch):
 #         model(input_image)
 
 #         content_loss = 0
-#         for ct_loss in model.content_losses:
+#         for ct_loss in module.content_losses:
 #             content_loss += ct_loss.loss
         
 #         style_loss = 0
 #         i = 0
-#         for st_loss in model.style_losses:
+#         for st_loss in module.style_losses:
 #             style_loss += (st_loss.loss * styleRelativeWeights[i])
 #             i += 1
 
@@ -318,15 +318,16 @@ def train(epoch):
 #     optimizer.step(closure)
 #     input_image.data.clamp_(0, 1)
 
-import matplotlib.pyplot as plt
 def show():
-    f, axarray = plt.subplots(1, 3)
-    axarray[0].imshow(image_reconstruct(content_image.detach()))
-    axarray[0].axis('off')
-    axarray[1].imshow(image_reconstruct(style_image.detach()))
-    axarray[1].axis('off')
-    axarray[2].imshow(image_reconstruct(input_image.detach()))  
-    axarray[2].axis('off')
+    # f, axarray = plt.subplots(1, 3)
+    # axarray[0].imshow(image_reconstruct(content_image.detach()))
+    # axarray[0].axis('off')
+    # axarray[1].imshow(image_reconstruct(style_image.detach()))
+    # axarray[1].axis('off')
+    # axarray[2].imshow(image_reconstruct(input_image.detach()))  
+    # axarray[2].axis('off')
+
+    plt.imshow(image_reconstruct(input_image.detach()))
 
     plt.show()
 
@@ -338,8 +339,11 @@ def go():
         print('epoch {}'.format(epoch))
         train(epoch)
         epoch += 1
+        if epoch % 1000 == 0:
+            save()
 
-def save(info=None):
+def save():
+    print('\n\n\nSaving......\n\n\n')
     t_info = '' if info is None else '_{}'.format(info)
     style_img_sn = style_image_name.split('_')[1].split('.')[0]
     content_img_sn = content_image_name.split('_')[1].split('.')[0]
@@ -360,7 +364,7 @@ def save(info=None):
         if i < len(contentTensorNames) - 1:
             content_config_str += ','
 
-    filename = style_img_sn + 'x' + str(styleWeight) + '@' + style_config_str + '_' + content_img_sn + 'x' + str(contentWeight) + '@' + content_config_str + '_' + str(epoch) + t_info
+    filename = style_img_sn + 'x' + str(styleWeight) + '@' + style_config_str + '_' + content_img_sn + 'x' + str(contentWeight) + '@' + content_config_str + t_info
     path = os.path.join(os.path.dirname(__file__), 'outputs/{}.jpg'.format(filename))
 
     output_img = image_reconstruct(input_image.detach())
