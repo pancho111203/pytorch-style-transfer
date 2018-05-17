@@ -12,8 +12,8 @@ import torchvision.models as models
 import torch.optim as optim
 from torchvision import transforms
 from PIL import Image
-from utils.transforms import UnNormalize
-from utils.utils import adjust_learning_rate, set_learning_rate, get_learning_rate, LearningRateAdapter
+from pytorch_utils.transforms import UnNormalize
+from pytorch_utils.general import adjust_learning_rate, set_learning_rate, get_learning_rate, LearningRateAdapter
 import numpy as np
 import matplotlib.pyplot as plt
 
