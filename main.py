@@ -14,26 +14,79 @@ from torchvision import transforms
 from PIL import Image
 from pytorch_utils.transforms import UnNormalize
 from pytorch_utils.general import adjust_learning_rate, set_learning_rate, get_learning_rate, LearningRateAdapter
+from pytorch_utils.helpers.Metrics import Metrics
 import numpy as np
 import matplotlib.pyplot as plt
+
+argparser = argparse.ArgumentParser(description='Neural style transfer')
+argparser.add_argument('--style-image', '-si', type=str, default='data/style_vangogh.jpg')
+argparser.add_argument('--content-image', '-ci', type=str, default='data/content_bridge.jpg')
+argparser.add_argument('--style-tensors', '-st', type=int, nargs='*', default=[2, 4, 8, 12, 16])
+argparser.add_argument('--content-tensors', '-ct', type=int, nargs='*', default=[9])
+argparser.add_argument('--style-weight', '-sw', type=float, default=100000.0)
+argparser.add_argument('--content-weight', '-cw', type=float, default=1)
+argparser.add_argument('--noise-strength', '-n', type=float, default=0.6)
+argparser.add_argument('--image-size', '-s', type=int, default=224)
+argparser.add_argument('--learning-rate', '-lr', type=float, default=100)
+argparser.add_argument('--adaptative-lr', '-adlr', default=False, action='store_true')
+argparser.add_argument('--style-relative-weights', '-srw', type=float, nargs='*', default=[0.5, 0.5, 1.5, 3.0, 4.0])
+argparser.add_argument('--output-name', '-o', type=str, default=None)
+argparser.add_argument('--output-info', '-i', type=str, default=None)
+argparser.add_argument('--average-pool', '-avgp', default=False, action='store_true')
+args = argparser.parse_args()
 
 # Inputs
 original_model = models.vgg19(pretrained=True)
 norm_values = ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
-styleTensorNames = ['conv_2', 'conv_4', 'conv_8', 'conv_12', 'conv_16']
-contentTensorNames = ['conv_9']
+styleTensorNames = ['conv_{}'.format(tensorIndex) for tensorIndex in args.style_tensors]
+contentTensorNames = ['conv_{}'.format(tensorIndex) for tensorIndex in args.content_tensors]
 
-styleRelativeWeights = [0.5, 0.5, 1.5, 3.0, 4.0]
-styleWeight = 100000.0
-contentWeight = 1
+styleWeight = args.style_weight
+contentWeight = args.content_weight
 
-info = 'avgpool_onlynoise'
+styleRelativeWeights = args.style_relative_weights
 
-imsize = (224, 224)
+imsize = (args.image_size, args.image_size)
 
-use_only_noise = True
-noise_strength = 0.6
+use_only_noise = True if args.noise_strength >= 1.0 else False
+noise_strength = args.noise_strength
+
+style_image_name = args.style_image
+content_image_name = args.content_image
+
+def get_output_name():
+    info = '' if args.output_info is None else '_{}'.format(args.output_info)
+    avgpool = '' if args.average_pool is False else '_avgpool'
+    onlynoise = '' if use_only_noise is False else '_onlynoise'
+    adapt_lr = '' if args.adaptative_lr is False else '_adaptlr'
+    style_img_sn = style_image_name.split('_')[1].split('.')[0]
+    content_img_sn = content_image_name.split('_')[1].split('.')[0]
+    style_config_str = ''
+    for i in range(0, len(styleTensorNames)):
+        tensorName = styleTensorNames[i]
+        relativeWeigth = styleRelativeWeights[i]
+        tensorIndex = tensorName.split('_')[1]
+
+        tensor_config_str = tensorIndex + ':' + str(relativeWeigth)
+        style_config_str += tensor_config_str
+        if i < len(styleTensorNames) - 1:
+            style_config_str += ','
+
+    content_config_str = ''
+    for i in range(0, len(contentTensorNames)):
+        content_config_str += contentTensorNames[i].split('_')[1]
+        if i < len(contentTensorNames) - 1:
+            content_config_str += ','
+
+    return str(args.image_size) + 'x' + str(args.image_size) + '_' + style_img_sn + 'x' + str(styleWeight) + '@' + style_config_str + '_' + content_img_sn + 'x' + str(contentWeight) + '@' + content_config_str + avgpool + onlynoise + adapt_lr + info
+
+print(args.adaptative_lr)
+filename = args.output_name if args.output_name is not None else get_output_name()
+print('Filename: {}'.format(filename))
+if not os.path.exists(os.path.join(os.path.dirname(__file__), 'logs')):
+    os.makedirs(os.path.join(os.path.dirname(__file__), 'logs'))
+metrics = Metrics(os.path.join(os.path.dirname(__file__), 'logs/{}'.format(filename)), save_every=50)
 
 """
     0 is conv1 (3, 3, 3, 64)
@@ -86,17 +139,8 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 original_model = original_model.to(device)
 
-
-style_image_name = 'data/style_vangogh.jpg'
-content_image_name = 'data/content_bridge.jpg'
 style_image_path = os.path.join(os.path.dirname(__file__), style_image_name)
 content_image_path = os.path.join(os.path.dirname(__file__), content_image_name)
-
-
-parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
-parser.add_argument('--lr', default=100, type=float, help='learning rate')
-parser.add_argument('--resume', '-r', action='store_true', help='resume from checkpoint')
-args = parser.parse_args()
 
 # Transforms
 transform_image = transforms.Compose([
@@ -180,8 +224,8 @@ class Model(nn.Module):
                 layer = nn.ReLU(inplace=False)
             elif isinstance(layer, nn.MaxPool2d):
                 name = 'pool_{}'.format(i)
-
-                layer = nn.AvgPool2d(2)
+                if args.average_pool:
+                    layer = nn.AvgPool2d(2)
             elif isinstance(layer, nn.BatchNorm2d):
                 name = 'bn_{}'.format(i)
             else:
@@ -256,8 +300,9 @@ else:
 
 input_image.requires_grad_()
 
-optimizer = optim.Adam([input_image], lr = args.lr)
-lr_adapter = LearningRateAdapter(optimizer, args.lr, min_lr=0.01, lr_reduction_percentage=0.7, loss_worsening_count_limit=8)
+optimizer = optim.Adam([input_image], lr = args.learning_rate)
+if args.adaptative_lr:
+    lr_adapter = LearningRateAdapter(optimizer, args.learning_rate, min_lr=0.01, lr_reduction_percentage=0.7, loss_worsening_count_limit=8)
 def train(epoch):
     global input_image
     model.train()
@@ -284,9 +329,9 @@ def train(epoch):
     optimizer.step()
     print('Content Loss: {}, Style Loss: {}, Total: {}'.format(content_loss, style_loss, loss))
     input_image.data.clamp_(0, 1)
-
-    lr_changed = lr_adapter.update_loss(loss)
-
+    if args.adaptative_lr:
+        lr_adapter.update_loss(loss)
+    return (content_loss.item(), style_loss.item(), loss.item())
 # #for LBFGS optim
 # # Currently not working, learning rate fluctuates a lot and never decreases consistently
 # optimizer = optim.LBFGS([input_image])
@@ -334,37 +379,17 @@ def show():
 epoch = 0
 def go():
     global epoch
-    while True:
-        # adjust_learning_rate(optimizer, epoch, args.lr, 0.8, 150, 0.2)
+    while get_learning_rate(optimizer)[0] > 0.01:
         print('epoch {}'.format(epoch))
-        train(epoch)
+        (content_loss, style_loss, total_loss) = train(epoch)
         epoch += 1
-        if epoch % 1000 == 0:
-            save()
+        metrics.track({'epoch': epoch, 'content_loss': content_loss, 'style_loss': style_loss, 'total_loss': total_loss })
+    metrics.save()
+    save()
+    show()
 
 def save():
     print('\n\n\nSaving......\n\n\n')
-    t_info = '' if info is None else '_{}'.format(info)
-    style_img_sn = style_image_name.split('_')[1].split('.')[0]
-    content_img_sn = content_image_name.split('_')[1].split('.')[0]
-    style_config_str = ''
-    for i in range(0, len(styleTensorNames)):
-        tensorName = styleTensorNames[i]
-        relativeWeigth = styleRelativeWeights[i]
-        tensorIndex = tensorName.split('_')[1]
-
-        tensor_config_str = tensorIndex + ':' + str(relativeWeigth)
-        style_config_str += tensor_config_str
-        if i < len(styleTensorNames) - 1:
-            style_config_str += ','
-
-    content_config_str = ''
-    for i in range(0, len(contentTensorNames)):
-        content_config_str += contentTensorNames[i].split('_')[1]
-        if i < len(contentTensorNames) - 1:
-            content_config_str += ','
-
-    filename = style_img_sn + 'x' + str(styleWeight) + '@' + style_config_str + '_' + content_img_sn + 'x' + str(contentWeight) + '@' + content_config_str + t_info
     path = os.path.join(os.path.dirname(__file__), 'outputs/{}.jpg'.format(filename))
 
     output_img = image_reconstruct(input_image.detach())
